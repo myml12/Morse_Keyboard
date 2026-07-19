@@ -1,0 +1,8 @@
+# ビルド成果物
+sim/morse_simulator
+sim/*.o
+
+# その他
+__pycache__/
+*.pyc
+.DS_Store
