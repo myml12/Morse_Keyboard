@@ -6,14 +6,6 @@
 // ESP32-C3 Morse keyboard (_2)
 // 離したら余分な要素を出さない Iambic A: Dit=1、要素間=1、Dah=設定比。
 // ブザーは他励式（パッシブ）→ LEDC でサイドトーンを出す。
-//
-// GATT_INSUF_ENCRYPTION が出て文字送信が遅延／不安定なとき:
-// ライブラリ BleKeyboard.cpp の
-//   setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND)
-// を
-//   setAuthenticationMode(ESP_LE_AUTH_BOND)
-// に変更し、ホスト側で一度ペアリングを削除してから再ペアする。
-// （C3/S3 でよくある問題。CPU 性能不足ではない。）
 
 constexpr uint8_t DOT_PIN = D0;      // 短点
 constexpr uint8_t DASH_PIN = D1;     // 長点
@@ -25,16 +17,84 @@ constexpr uint8_t WPM = 22;
 constexpr float DASH_RATIO = 3.0f;  // Icom の 1:1:X、X は 2.8〜4.5
 constexpr uint8_t CONTACT_DEBOUNCE_MS = 20;
 constexpr uint8_t RELEASE_REARM_MS = 20;
+constexpr uint8_t CHARACTER_GAP_DOTS = 2;
+// BLE HID は key down / key up を別々の接続イベントで処理させる。
+// 速すぎる notify の連続を避け、C3 でもホスト側の受信キューを詰まらせない。
+constexpr uint8_t BLE_TX_QUEUE_SIZE = 64;
+constexpr uint16_t BLE_CONNECT_SETTLE_MS = 800;
+constexpr uint16_t BLE_KEY_DOWN_MS = 20;
+constexpr uint16_t BLE_KEY_GAP_MS = 20;
 
 // BleKeyboard の名前は最大15文字程度。区別用に _2 を付ける。
 BleKeyboard bleKeyboard("XIAO Morse_2", "Y.Mizuno", 100);
 
 uint32_t dotMs() { return 1200UL / WPM; }
 
-void writeKeyboard(uint8_t character) {
-  if (!bleKeyboard.isConnected()) return;
-  bleKeyboard.write(character);
-}
+class BleTextSender {
+ public:
+  // 接続中に確定した文字だけをキューへ入れる。切断中の入力を、再接続後に
+  // 意図せず送信しないためである。
+  void enqueue(uint8_t character) {
+    if (!bleKeyboard.isConnected() || count_ == BLE_TX_QUEUE_SIZE) return;
+    queue_[tail_] = character;
+    tail_ = (tail_ + 1) % BLE_TX_QUEUE_SIZE;
+    ++count_;
+  }
+
+  void tick(uint32_t now) {
+    const bool connected = bleKeyboard.isConnected();
+    if (!connected) {
+      connected_ = false;
+      clear();
+      state_ = State::Idle;
+      return;
+    }
+
+    // isConnected() は暗号化と通知購読が完了するより先に true になることがある。
+    if (!connected_) {
+      connected_ = true;
+      readyAtMs_ = now + BLE_CONNECT_SETTLE_MS;
+      state_ = State::Idle;
+    }
+    if (static_cast<int32_t>(now - readyAtMs_) < 0 ||
+        static_cast<int32_t>(now - deadlineMs_) < 0) {
+      return;
+    }
+
+    if (state_ == State::KeyDown) {
+      bleKeyboard.releaseAll();
+      state_ = State::Idle;
+      deadlineMs_ = now + BLE_KEY_GAP_MS;
+      return;
+    }
+
+    if (count_ == 0) return;
+    const uint8_t character = queue_[head_];
+    head_ = (head_ + 1) % BLE_TX_QUEUE_SIZE;
+    --count_;
+    bleKeyboard.press(character);
+    state_ = State::KeyDown;
+    deadlineMs_ = now + BLE_KEY_DOWN_MS;
+  }
+
+ private:
+  enum class State : uint8_t { Idle, KeyDown };
+
+  void clear() { head_ = tail_ = count_ = 0; }
+
+  uint8_t queue_[BLE_TX_QUEUE_SIZE]{};
+  uint8_t head_ = 0;
+  uint8_t tail_ = 0;
+  uint8_t count_ = 0;
+  bool connected_ = false;
+  State state_ = State::Idle;
+  uint32_t readyAtMs_ = 0;
+  uint32_t deadlineMs_ = 0;
+};
+
+BleTextSender bleTextSender;
+
+void writeKeyboard(uint8_t character) { bleTextSender.enqueue(character); }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
 #define BUZZER_LEDC_ID BUZZER_PIN
@@ -82,7 +142,7 @@ class MorseDecoder {
  public:
   void flush(uint32_t now) {
     const uint32_t silence = now - lastElementEndMs_;
-    if (characterPending_ && silence >= dotMs() * 3UL) {
+    if (characterPending_ && silence >= dotMs() * CHARACTER_GAP_DOTS) {
       char decoded = '\0';
       for (const auto& entry : MORSE_TABLE) {
         if (strcmp(marks_, entry.code) == 0) {
@@ -149,6 +209,18 @@ class IambicKeyer {
  public:
   void setPaddle(uint8_t element, bool pressed) {
     if (pressed && !dit_ && !dah_ && phase_ == Phase::Idle) first_ = element;
+
+    // 要素の途中または要素間に短く入った反対側のパドルも、次の要素として
+    // 保持する。従来は長点の最中に短点を離すと、長点終了時には dit_ が false
+    // となり、その短点が消えていた。
+    if (pressed && phase_ != Phase::Idle) {
+      if (element == 0) {
+        ditPending_ = true;
+      } else {
+        dahPending_ = true;
+      }
+    }
+
     if (element == 0) {
       dit_ = pressed;
     } else {
@@ -176,6 +248,7 @@ class IambicKeyer {
     if (next < 0) {
       phase_ = Phase::Idle;
       last_ = first_ = -1;
+      ditPending_ = dahPending_ = false;
       return;
     }
     start(next, now);
@@ -187,12 +260,14 @@ class IambicKeyer {
   enum class Phase : uint8_t { Idle, Mark, Gap };
 
   int nextElement() {
-    if (dit_ && dah_) {
+    const bool ditAvailable = dit_ || ditPending_;
+    const bool dahAvailable = dah_ || dahPending_;
+    if (ditAvailable && dahAvailable) {
       if (last_ < 0) return first_ >= 0 ? first_ : 0;
       return 1 - last_;
     }
-    if (dit_ || dah_) {
-      return dit_ ? 0 : 1;
+    if (ditAvailable || dahAvailable) {
+      return ditAvailable ? 0 : 1;
     }
     return -1;
   }
@@ -200,6 +275,11 @@ class IambicKeyer {
   void start(int element, uint32_t now) {
     current_ = last_ = element;
     first_ = -1;
+    if (element == 0) {
+      ditPending_ = false;
+    } else {
+      dahPending_ = false;
+    }
     sidetone.begin(element == 1, now);
     phase_ = Phase::Mark;
     const uint32_t duration =
@@ -210,6 +290,8 @@ class IambicKeyer {
 
   bool dit_ = false;
   bool dah_ = false;
+  bool ditPending_ = false;
+  bool dahPending_ = false;
   int current_ = -1;
   int last_ = -1;
   int first_ = -1;
@@ -274,8 +356,6 @@ void setup() {
   configureInput(DOT_PIN);
   configureInput(DASH_PIN);
   initBuzzer();
-  // 既定 8ms/キーは遅めに感じることがある。モールス1文字送信なら短くてよい。
-  bleKeyboard.setDelay(2);
   bleKeyboard.begin();
 }
 
@@ -284,5 +364,6 @@ void loop() {
   updatePaddles(now);
   keyer.tick(now);
   if (!keyer.sending()) decoder.flush(now);
+  bleTextSender.tick(now);
   delay(1);
 }
