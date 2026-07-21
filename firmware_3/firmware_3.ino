@@ -42,7 +42,7 @@ constexpr uint16_t BLE_KEY_GAP_MS = 20;
 uint8_t wpm = 22;
 uint8_t volumeLevel = 1;  // 0 (mute) - 10 (maximum PWM duty)
 
-BleKeyboard bleKeyboard("XIAO Morse_3", "Y.Mizuno", 100);
+BleKeyboard bleKeyboard("Morse_Keyboard_beta3", "myml12", 100);
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 bool displayReady = false;
 bool displayDirty = true;
